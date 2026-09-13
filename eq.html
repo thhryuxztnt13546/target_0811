@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Web Audio Parametric EQ Demo</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #111;
+    color: #ddd;
+    font: 14px system-ui, sans-serif;
+  }
+  .wrap {
+    max-width: 1100px;
+    margin: 30px auto;
+    padding: 0 18px;
+  }
+  h2 { margin: 0 0 14px; }
+  .toolbar {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+  }
+  button, input[type=file] {
+    background: #222;
+    color: #ddd;
+    border: 1px solid #444;
+    border-radius: 6px;
+    padding: 7px 10px;
+  }
+  #status { opacity: .7; }
+  .panel {
+    background: #181818;
+    border: 1px solid #333;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 520px;
+    cursor: crosshair;
+  }
+  .hint {
+    margin-top: 10px;
+    opacity: .65;
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2>Parametric EQ</h2>
+
+  <div class="toolbar">
+    <input id="file" type="file" accept="audio/*">
+    <button id="play">播放</button>
+    <button id="reset">重置 EQ</button>
+    <span id="status">选择一个音频文件</span>
+  </div>
+
+  <div class="panel">
+    <canvas id="eq"></canvas>
+  </div>
+
+  <div class="hint">
+    拖动节点：左右 = 频率，上下 = Gain；滚轮 = Q（曲线宽窄）。
+    灰色频谱 = 当前播放音频的实时 FFT，白色曲线 = EQ 总响应。
+    双击空白处添加一个 Bell EQ 节点；右键节点删除。
+  </div>
+
+  <audio id="audio" crossorigin="anonymous"></audio>
+</div>
+
+<script>
+const canvas = document.querySelector("#eq");
+const ctx2d = canvas.getContext("2d");
+const audio = document.querySelector("#audio");
+const file = document.querySelector("#file");
+const playButton = document.querySelector("#play");
+const resetButton = document.querySelector("#reset");
+const status = document.querySelector("#status");
+
+let audioContext;
+let source;
+let analyser;
+let output;
+let animationId;
+
+const MIN_FREQ = 20;
+const MAX_FREQ = 20000;
+const MIN_GAIN = -18;
+const MAX_GAIN = 18;
+
+const bands = [
+  { frequency: 100, gain: 0, Q: 1, node: null },
+  { frequency: 1000, gain: 0, Q: 1, node: null },
+  { frequency: 8000, gain: 0, Q: 1, node: null }
+];
+
+function ensureAudioGraph() {
+  if (audioContext) return;
+
+  audioContext = new AudioContext();
+  source = audioContext.createMediaElementSource(audio);
+
+  analyser = audioContext.createAnalyser();
+  analyser.fftSize = 2048;
+  analyser.smoothingTimeConstant = 0.75;
+
+  output = audioContext.createGain();
+
+  source.connect(analyser);
+  analyser.connect(output);
+  output.connect(audioContext.destination);
+
+  rebuildFilters();
+}
+
+function createFilter(band) {
+  const filter = audioContext.createBiquadFilter();
+  filter.type = "peaking";
+  filter.frequency.value = band.frequency;
+  filter.gain.value = band.gain;
+  filter.Q.value = band.Q;
+  return filter;
+}
+
+function rebuildFilters() {
+  if (!audioContext) return;
+
+  if (bands.length === 0) {
+    analyser.disconnect();
+    analyser.connect(output);
+    return;
+  }
+
+  analyser.disconnect();
+
+  let current = analyser;
+
+  for (const band of bands) {
+    if (!band.node) band.node = createFilter(band);
+
+    current.connect(band.node);
+    current = band.node;
+  }
+
+  current.connect(output);
+}
+
+function setBand(band) {
+  band.node.frequency.setTargetAtTime(
+    band.frequency,
+    audioContext.currentTime,
+    0.005
+  );
+
+  band.node.gain.setTargetAtTime(
+    band.gain,
+    audioContext.currentTime,
+    0.005
+  );
+
+  band.node.Q.setTargetAtTime(
+    band.Q,
+    audioContext.currentTime,
+    0.005
+  );
+}
+
+function resizeCanvas() {
+  const dpr = devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+
+  canvas.width = Math.round(rect.width * dpr);
+  canvas.height = Math.round(rect.height * dpr);
+
+  ctx2d.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function freqToX(freq) {
+  const width = canvas.clientWidth;
+  const min = Math.log10(MIN_FREQ);
+  const max = Math.log10(MAX_FREQ);
+
+  return (Math.log10(freq) - min) / (max - min) * width;
+}
+
+function xToFreq(x) {
+  const width = canvas.clientWidth;
+  const min = Math.log10(MIN_FREQ);
+  const max = Math.log10(MAX_FREQ);
+
+  return Math.pow(
+    10,
+    min + (x / width) * (max - min)
+  );
+}
+
+function gainToY(gain) {
+  const height = canvas.clientHeight;
+  return (MAX_GAIN - gain) / (MAX_GAIN - MIN_GAIN) * height;
+}
+
+function yToGain(y) {
+  const height = canvas.clientHeight;
+  return MAX_GAIN - y / height * (MAX_GAIN - MIN_GAIN);
+}
+
+function drawGrid() {
+  const width = canvas.clientWidth;
+  const height = canvas.clientHeight;
+
+  ctx2d.strokeStyle = "#292929";
+  ctx2d.fillStyle = "#777";
+  ctx2d.font = "12px system-ui";
+
+  const frequencies = [
+    20, 30, 50, 100, 200, 300, 500,
+    1000, 2000, 3000, 5000, 10000, 20000
+  ];
+
+  for (const freq of frequencies) {
+    const x = freqToX(freq);
+
+    ctx2d.beginPath();
+    ctx2d.moveTo(x, 0);
+    ctx2d.lineTo(x, height);
+    ctx2d.stroke();
+
+    if ([20, 100, 1000, 10000, 20000].includes(freq)) {
+      const label = freq >= 1000
+        ? `${freq / 1000}k`
+        : `${freq}`;
+
+      ctx2d.fillText(label, x + 4, height - 8);
+    }
+  }
+
+  for (let gain = -18; gain <= 18; gain += 6) {
+    const y = gainToY(gain);
+
+    ctx2d.beginPath();
+    ctx2d.moveTo(0, y);
+    ctx2d.lineTo(width, y);
+    ctx2d.stroke();
+
+    ctx2d.fillText(`${gain} dB`, 5, y - 4);
+  }
+}
+
+function drawSpectrum() {
+  if (!analyser) return;
+
+  const width = canvas.clientWidth;
+  const height = canvas.clientHeight;
+  const data = new Uint8Array(analyser.frequencyBinCount);
+
+  analyser.getByteFrequencyData(data);
+
+  ctx2d.beginPath();
+
+  const nyquist = audioContext.sampleRate / 2;
+
+  for (let i = 1; i < data.length; i++) {
+    const freq = i / data.length * nyquist;
+
+    if (freq < MIN_FREQ || freq > MAX_FREQ) continue;
+
+    const x = freqToX(freq);
+
+    // FFT magnitude -> 0..~18 dB visual range.
+    const db = (data[i] - 128) / 128 * 18;
+    const y = gainToY(Math.max(-18, db));
+
+    if (x === 0) ctx2d.moveTo(x, y);
+    else ctx2d.lineTo(x, y);
+  }
+
+  ctx2d.strokeStyle = "rgba(150,150,150,.45)";
+  ctx2d.lineWidth = 1;
+  ctx2d.stroke();
+}
+
+function calculateEqResponse() {
+  if (!audioContext) return null;
+
+  const frequencies = new Float32Array(512);
+  const response = new Float32Array(512);
+  const phases = new Float32Array(512);
+
+  for (let i = 0; i < frequencies.length; i++) {
+    frequencies[i] = Math.pow(
+      10,
+      Math.log10(MIN_FREQ) +
+      i / (frequencies.length - 1) *
+      (Math.log10(MAX_FREQ) - Math.log10(MIN_FREQ))
+    );
+  }
+
+  let magnitude = new Float32Array(512);
+  magnitude.fill(1);
+
+  for (const band of bands) {
+    const next = new Float32Array(512);
+
+    band.node.getFrequencyResponse(
+      frequencies,
+      response,
+      phases
+    );
+
+    for (let i = 0; i < next.length; i++) {
+      magnitude[i] *= response[i];
+    }
+  }
+
+  return { frequencies, magnitude };
+}
+
+function drawEqCurve() {
+  const result = calculateEqResponse();
+  if (!result) return;
+
+  ctx2d.beginPath();
+
+  for (let i = 0; i < result.frequencies.length; i++) {
+    const freq = result.frequencies[i];
+    const db = 20 * Math.log10(result.magnitude[i]);
+    const x = freqToX(freq);
+    const y = gainToY(
+      Math.max(MIN_GAIN, Math.min(MAX_GAIN, db))
+    );
+
+    if (i === 0) ctx2d.moveTo(x, y);
+    else ctx2d.lineTo(x, y);
+  }
+
+  ctx2d.strokeStyle = "#fff";
+  ctx2d.lineWidth = 2;
+  ctx2d.stroke();
+}
+
+function drawBands() {
+  ctx2d.font = "12px system-ui";
+
+  for (let i = 0; i < bands.length; i++) {
+    const band = bands[i];
+    const x = freqToX(band.frequency);
+    const y = gainToY(band.gain);
+
+    ctx2d.beginPath();
+    ctx2d.arc(x, y, 8, 0, Math.PI * 2);
+    ctx2d.fillStyle = "#181818";
+    ctx2d.fill();
+    ctx2d.strokeStyle = "#fff";
+    ctx2d.lineWidth = 2;
+    ctx2d.stroke();
+
+    ctx2d.fillStyle = "#aaa";
+    ctx2d.fillText(
+      `${i + 1}  ${formatFreq(band.frequency)} / ${band.gain.toFixed(1)} dB / Q ${band.Q.toFixed(2)}`,
+      x + 12,
+      y - 12
+    );
+  }
+}
+
+function formatFreq(freq) {
+  if (freq >= 1000) return `${(freq / 1000).toFixed(2)}k`;
+  return `${Math.round(freq)} Hz`;
+}
+
+function draw() {
+  const width = canvas.clientWidth;
+  const height = canvas.clientHeight;
+
+  ctx2d.clearRect(0, 0, width, height);
+
+  drawGrid();
+  drawSpectrum();
+  drawEqCurve();
+  drawBands();
+
+  animationId = requestAnimationFrame(draw);
+}
+
+let dragging = null;
+
+canvas.addEventListener("pointerdown", event => {
+  const rect = canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+
+  dragging = findBand(x, y);
+
+  if (dragging) {
+    canvas.setPointerCapture(event.pointerId);
+  }
+});
+
+canvas.addEventListener("pointermove", event => {
+  if (!dragging) return;
+
+  const rect = canvas.getBoundingClientRect();
+  const x = Math.max(0, Math.min(
+    canvas.clientWidth,
+    event.clientX - rect.left
+  ));
+  const y = Math.max(0, Math.min(
+    canvas.clientHeight,
+    event.clientY - rect.top
+  ));
+
+  dragging.frequency = Math.max(
+    MIN_FREQ,
+    Math.min(MAX_FREQ, xToFreq(x))
+  );
+
+  dragging.gain = Math.max(
+    MIN_GAIN,
+    Math.min(MAX_GAIN, yToGain(y))
+  );
+
+  if (audioContext) setBand(dragging);
+});
+
+canvas.addEventListener("pointerup", () => {
+  dragging = null;
+});
+
+canvas.addEventListener("wheel", event => {
+  const rect = canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const band = findBand(x, y);
+
+  if (!band) return;
+
+  event.preventDefault();
+
+  // wheel up = narrower; wheel down = wider
+  const factor = Math.exp(event.deltaY * 0.002);
+  band.Q = Math.max(.05, Math.min(20, band.Q * factor));
+
+  if (audioContext) setBand(band);
+}, { passive: false });
+
+canvas.addEventListener("dblclick", event => {
+  ensureAudioGraph();
+
+  const rect = canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+
+  const band = {
+    frequency: xToFreq(x),
+    gain: Math.max(MIN_GAIN, Math.min(MAX_GAIN, yToGain(y))),
+    Q: 1,
+    node: null
+  };
+
+  band.node = createFilter(band);
+  bands.push(band);
+  rebuildFilters();
+});
+
+canvas.addEventListener("contextmenu", event => {
+  event.preventDefault();
+
+  const rect = canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const band = findBand(x, y);
+
+  if (!band) return;
+
+  band.node?.disconnect();
+
+  const index = bands.indexOf(band);
+  if (index >= 0) bands.splice(index, 1);
+
+  rebuildFilters();
+});
+
+function findBand(x, y) {
+  let best = null;
+  let distance = Infinity;
+
+  for (const band of bands) {
+    const dx = x - freqToX(band.frequency);
+    const dy = y - gainToY(band.gain);
+    const d = Math.hypot(dx, dy);
+
+    if (d < distance && d <= 16) {
+      best = band;
+      distance = d;
+    }
+  }
+
+  return best;
+}
+
+file.addEventListener("change", () => {
+  const selected = file.files[0];
+  if (!selected) return;
+
+  ensureAudioGraph();
+
+  audio.src = URL.createObjectURL(selected);
+  status.textContent = selected.name;
+});
+
+playButton.addEventListener("click", async () => {
+  ensureAudioGraph();
+
+  if (audioContext.state === "suspended") {
+    await audioContext.resume();
+  }
+
+  if (audio.paused) {
+    await audio.play();
+    playButton.textContent = "暂停";
+  } else {
+    audio.pause();
+    playButton.textContent = "播放";
+  }
+});
+
+resetButton.addEventListener("click", () => {
+  for (const band of bands) {
+    band.frequency = band.frequency;
+    band.gain = 0;
+    band.Q = 1;
+
+    if (band.node && audioContext) {
+      setBand(band);
+    }
+  }
+});
+
+window.addEventListener("resize", resizeCanvas);
+
+resizeCanvas();
+draw();
+</script>
+</body>
+</html>
